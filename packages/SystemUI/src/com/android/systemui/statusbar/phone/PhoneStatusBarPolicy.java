@@ -29,15 +29,22 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.media.AudioManager;
 // QTI_BEGIN: 2020-04-22: WLAN: wifi: refactor Wi-Fi generation UI enhancements
 import android.net.wifi.ScanResult;
 // QTI_END: 2020-04-22: WLAN: wifi: refactor Wi-Fi generation UI enhancements
 import android.net.wifi.WifiManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.Settings.Global;
 import android.service.notification.ZenModeConfig;
@@ -45,6 +52,7 @@ import android.telecom.TelecomManager;
 import android.text.format.DateFormat;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
 import androidx.lifecycle.Observer;
 
 import com.android.internal.statusbar.StatusBarIcon;
@@ -130,6 +138,7 @@ public class PhoneStatusBarPolicy
     private final String mSlotSensorsOff;
     private final String mSlotScreenRecord;
     private final String mSlotConnectedDisplay;
+    private final String mSlotFirewall;
     private final int mDisplayId;
     private final SharedPreferences mSharedPreferences;
     private final DateFormatUtil mDateFormatUtil;
@@ -137,6 +146,7 @@ public class PhoneStatusBarPolicy
     private final ConnectedDisplayInteractor mConnectedDisplayInteractor;
     private final TelecomManager mTelecomManager;
 
+    private final Context mContext;
     private final Handler mHandler;
     private final HotspotController mHotspot;
     private final NextAlarmController mNextAlarmController;
@@ -162,6 +172,7 @@ public class PhoneStatusBarPolicy
     private final RingerModeTracker mRingerModeTracker;
     private final PrivacyLogger mPrivacyLogger;
     private final ZenModeInteractor mZenModeInteractor;
+    private final ConnectivityManager mConnectivityManager;
 
     private boolean mZenVisible;
     private boolean mVibrateVisible;
@@ -170,14 +181,17 @@ public class PhoneStatusBarPolicy
 
     private boolean mProfileIconVisible = false;
     private final String mSlotTurboDsda;
+    private boolean mFirewallVisible = false;
+
+    private int mLastResumedActivityUid = -1;
 
     private BluetoothController mBluetooth;
-    private AlarmManager.AlarmClockInfo mNextAlarm;
+    private AlarmClockInfo mNextAlarm;
 
     private final FiveGServiceClient mFiveGServiceClient;
 
     @Inject
-    public PhoneStatusBarPolicy(StatusBarIconController iconController,
+    public PhoneStatusBarPolicy(Context context, StatusBarIconController iconController,
             CommandQueue commandQueue, BroadcastDispatcher broadcastDispatcher,
             @Main Executor mainExecutor, @UiBackground Executor uiBgExecutor, @Main Looper looper,
             @Main Resources resources,
@@ -200,6 +214,7 @@ public class PhoneStatusBarPolicy
             ZenModeInteractor zenModeInteractor,
             JavaAdapter javaAdapter, FiveGServiceClient fiveGServiceClient
     ) {
+        mContext = context;
         mIconController = iconController;
         mCommandQueue = commandQueue;
         mConnectedDisplayInteractor = connectedDisplayInteractor;
@@ -231,6 +246,7 @@ public class PhoneStatusBarPolicy
         mJavaAdapter = javaAdapter;
         mFiveGServiceClient = fiveGServiceClient;
         mSlotTurboDsda = resources.getString(R.string.status_bar_turbo_dsda);
+        mConnectivityManager = context.getSystemService(ConnectivityManager.class);
 
         mSlotConnectedDisplay = resources.getString(
                 com.android.internal.R.string.status_bar_connected_display);
@@ -252,6 +268,7 @@ public class PhoneStatusBarPolicy
         mSlotSensorsOff = resources.getString(com.android.internal.R.string.status_bar_sensors_off);
         mSlotScreenRecord = resources.getString(
                 com.android.internal.R.string.status_bar_screen_record);
+        mSlotFirewall = resources.getString(R.string.status_bar_firewall_slot);
 
         mDisplayId = displayId;
         mSharedPreferences = sharedPreferences;
@@ -354,6 +371,10 @@ public class PhoneStatusBarPolicy
 
         mIconController.setIcon(mSlotTurboDsda, R.drawable.ic_turbo_dsda, null);
         mIconController.setIconVisibility(mSlotTurboDsda, false);
+
+        // firewall
+        mIconController.setIcon(mSlotFirewall, R.drawable.stat_sys_firewall, null);
+        mIconController.setIconVisibility(mSlotFirewall, mFirewallVisible);
 
         mRotationLockController.addCallback(this);
         mBluetooth.addCallback(this);
@@ -595,6 +616,84 @@ public class PhoneStatusBarPolicy
         });
     }
 
+    private void registerBlockedStatusChangedCallbackForLastResumedActivityUid() {
+        mUiBgExecutor.execute(() -> {
+            try {
+                final int uid = ActivityTaskManager.getService().getLastResumedActivityUid();
+                if (mLastResumedActivityUid != uid) {
+                    mLastResumedActivityUid = uid;
+                    try {
+                        mConnectivityManager.unregisterNetworkCallback(mNetworkCallback);
+                    } catch (IllegalArgumentException e) {
+                        // Ignore
+                    }
+                    mConnectivityManager.registerDefaultNetworkCallbackForUid(uid, mNetworkCallback,
+                            mHandler);
+                }
+            } catch (RemoteException e) {
+                Log.w(TAG, "registerBlockedStatusChangedCallbackForLastResumedActivityUid", e);
+            }
+        });
+    }
+
+    private final ConnectivityManager.NetworkCallback mNetworkCallback =
+            new ConnectivityManager.NetworkCallback() {
+
+                @Override
+                public void onBlockedStatusChanged(@NonNull Network network, int blocked) {
+                    mHandler.post(() -> {
+                        registerBlockedStatusChangedCallbackForLastResumedActivityUid();
+                        mUiBgExecutor.execute(() -> {
+                            try {
+                                final int uid = ActivityTaskManager.getService()
+                                        .getLastResumedActivityUid();
+                                if (uid != Process.INVALID_UID) {
+                                    mMainExecutor.execute(() -> {
+                                        boolean isLauncher = false;
+                                        List<ResolveInfo> homeActivities = mContext
+                                                .getPackageManager().queryIntentActivitiesAsUser(
+                                                        new Intent(Intent.ACTION_MAIN)
+                                                                .addCategory(Intent.CATEGORY_HOME)
+                                                                .addCategory(
+                                                                        Intent.CATEGORY_DEFAULT),
+                                                        PackageManager.ResolveInfoFlags.of(0),
+                                                        UserHandle.getUserId(uid));
+                                        for (ResolveInfo homeActivity : homeActivities) {
+                                            int homeUid =
+                                                    homeActivity.activityInfo.applicationInfo.uid;
+                                            if (uid == homeUid) {
+                                                isLauncher = true;
+                                                break;
+                                            }
+                                        }
+                                        final boolean finalIsLauncher = isLauncher;
+                                        final boolean showIcon;
+                                        if (!finalIsLauncher
+                                                && blocked
+                                                != ConnectivityManager.BLOCKED_REASON_NONE
+                                                && (!mKeyguardStateController.isShowing()
+                                                || mKeyguardStateController.isOccluded())) {
+                                            showIcon = true;
+                                            mIconController.setIcon(mSlotFirewall,
+                                                    R.drawable.stat_sys_firewall, null);
+                                        } else {
+                                            showIcon = false;
+                                        }
+                                        if (mFirewallVisible != showIcon) {
+                                            mIconController.setIconVisibility(mSlotFirewall,
+                                                    showIcon);
+                                            mFirewallVisible = showIcon;
+                                        }
+                                    });
+                                }
+                            } catch (RemoteException e) {
+                                Log.w(TAG, "onBlockedStatusChanged", e);
+                            }
+                        });
+                    });
+                }
+            };
+
     private final UserTracker.Callback mUserSwitchListener =
             new UserTracker.Callback() {
                 @Override
@@ -629,7 +728,7 @@ public class PhoneStatusBarPolicy
     private final NextAlarmController.NextAlarmChangeCallback mNextAlarmCallback =
             new NextAlarmController.NextAlarmChangeCallback() {
                 @Override
-                public void onNextAlarmChanged(AlarmManager.AlarmClockInfo nextAlarm) {
+                public void onNextAlarmChanged(AlarmClockInfo nextAlarm) {
                     mNextAlarm = nextAlarm;
                     updateAlarm();
                 }
@@ -650,6 +749,7 @@ public class PhoneStatusBarPolicy
             boolean forced) {
         if (mDisplayId == displayId) {
             updateProfileIcon();
+            registerBlockedStatusChangedCallbackForLastResumedActivityUid();
         }
     }
 
@@ -657,12 +757,14 @@ public class PhoneStatusBarPolicy
     public void appTransitionFinished(int displayId) {
         if (mDisplayId == displayId) {
             updateProfileIcon();
+            registerBlockedStatusChangedCallbackForLastResumedActivityUid();
         }
     }
 
     @Override
     public void onKeyguardShowingChanged() {
         updateProfileIcon();
+        registerBlockedStatusChangedCallbackForLastResumedActivityUid();
     }
 
     @Override
